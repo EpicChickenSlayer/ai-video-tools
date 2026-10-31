@@ -44,6 +44,8 @@ python video_interpolator.py
 
 ## Video upscaler
 
+![Video upscaler window](screenshots/upscaler.png)
+
 1. Choose the input video with **Browse...** (`.mp4`, `.avi`, `.mkv`) and the model with **Browse Model...** (`.pth`).
 2. Pick the **upscale factor**: 1.5x, 2x, 3x or 4x. The network runs at its native scale and the result is resized to the exact target size, so any factor works with any model.
 3. Press **Start Upscaling**. The output file can be typed or chosen with **Save As...**; if it is empty you are asked when you start.
@@ -73,6 +75,8 @@ Options under *Memory settings*:
 Tips: for 2x output, a native 2x model (RealESRGAN_x2plus) or a compact model is much faster than running a 4x model and scaling down. Upscaling is slow by nature; a few minutes per second of 720p video is normal.
 
 ## Video interpolator
+
+![Video interpolator window](screenshots/interpolator.png)
 
 1. Choose the input video with **Browse...** and the model with **Browse Model...** (the `flownet.pkl` of a RIFE release).
 2. Choose the **target frame rate** (60, 50, 48, 90 or 120). It has to be at least 10 % above the source rate.
