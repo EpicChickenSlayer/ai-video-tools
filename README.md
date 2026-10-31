@@ -29,7 +29,7 @@ Both tools:
 
 ```bash
 brew install ffmpeg python-tk
-git clone https://github.com/<your-username>/ai-video-tools.git
+git clone https://github.com/EpicChickenSlayer/ai-video-tools.git
 cd ai-video-tools
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
