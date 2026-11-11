@@ -399,7 +399,7 @@ class RecWriter:
 
 def retime(src, dst, expr):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-vf", f"setpts='{expr}',settb=1/1000", "-fps_mode", "passthrough",
-                    "-enc_time_base", "-1", "-an", "-c:v", "ffv1", "-pix_fmt", "bgr0", dst], check=True)
+                    "-enc_time_base", "1/1000", "-an", "-c:v", "ffv1", "-pix_fmt", "bgr0", dst], check=True)
 
 def true_times(path):
     out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",

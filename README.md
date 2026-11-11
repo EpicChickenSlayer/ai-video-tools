@@ -15,6 +15,7 @@ Both tools:
 - show a progress bar with ETA and have a Cancel button that deletes the half-written output
 - batch frames by a memory budget and recover from GPU out-of-memory errors automatically by shrinking the batch and then the tile or flow size
 - keep all heavy work in a worker thread so the window stays responsive
+- accept files by **drag and drop**: drop a video and a model onto the window (optional, see [Drag and drop](#drag-and-drop))
 - report problems in plain language (not a video, wrong or unsupported model, output path equals input path, ...)
 
 ## Requirements
@@ -23,6 +24,7 @@ Both tools:
 - Python 3.10 or newer
 - [ffmpeg](https://ffmpeg.org/) (needed for audio and for hardware encoding; without it the tools fall back to OpenCV's writer and the output has **no audio**)
 - Python packages: `torch`, `numpy`, `opencv-python`
+- Optional: `tkinterdnd2` for drag and drop (`pip install tkinterdnd2`). Without it the apps work the same, using the Browse buttons.
 - Tkinter (ships with most Python installs; on Homebrew Python install `python-tk`)
 
 ## Setup (macOS)
@@ -33,6 +35,7 @@ git clone https://github.com/EpicChickenSlayer/ai-video-tools.git
 cd ai-video-tools
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+pip install tkinterdnd2    # optional: enables drag and drop
 ```
 
 Run either app:
@@ -42,11 +45,22 @@ python video_upscaler.py
 python video_interpolator.py
 ```
 
+## Drag and drop
+
+With `tkinterdnd2` installed, drop files anywhere on either window instead of using the Browse buttons:
+
+- Drop a **video** (`.mp4`, `.avi`, `.mkv`), a **model**, or both at once. Files are sorted by extension. The upscaler takes `.pth` models; the interpolator takes `.pkl`, `.pth` or `.pt`.
+- Only one video and one model are used per drop. Anything else (a second video, a folder, an unsupported file type) is ignored, and the status line says what was ignored.
+- Drops are ignored while a job is running.
+- The bottom line of the window shows `Drag and drop: on`, or `off` with the reason.
+
+If the line says drag and drop is **off**, the apps keep working through the Browse buttons. If `tkinterdnd2` is installed but still reports it could not load, the cause is usually a Tcl/Tk version mismatch: its native extension is built for Tcl/Tk 8.x, while some Homebrew Python setups use Tcl/Tk 9.x. Check with `python -c "import tkinter; print(tkinter.TkVersion)"`. If it prints 9.0, try the `tkinterdnd2-universal` fork, or a Python build that uses Tk 8.6.
+
 ## Video upscaler
 
 ![Video upscaler window](screenshots/upscaler.png)
 
-1. Choose the input video with **Browse...** (`.mp4`, `.avi`, `.mkv`) and the model with **Browse Model...** (`.pth`).
+1. Choose the input video with **Browse...** (`.mp4`, `.avi`, `.mkv`) and the model with **Browse Model...** (`.pth`), or drop both onto the window.
 2. Pick the **upscale factor**: 1.5x, 2x, 3x or 4x. The network runs at its native scale and the result is resized to the exact target size, so any factor works with any model.
 3. Press **Start Upscaling**. The output file can be typed or chosen with **Save As...**; if it is empty you are asked when you start.
 
@@ -78,7 +92,7 @@ Tips: for 2x output, a native 2x model (RealESRGAN_x2plus) or a compact model is
 
 ![Video interpolator window](screenshots/interpolator.png)
 
-1. Choose the input video with **Browse...** and the model with **Browse Model...** (the `flownet.pkl` of a RIFE release).
+1. Choose the input video with **Browse...** and the model with **Browse Model...** (the `flownet.pkl` of a RIFE release), or drop both onto the window.
 2. Choose the **target frame rate** (60, 50, 48, 90 or 120). It has to be at least 10 % above the source rate.
 3. Press **Start Interpolation**. The output file can be typed or chosen with **Save As...**; if it is empty you are asked when you start.
 
