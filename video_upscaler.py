@@ -32,6 +32,11 @@ Setup (macOS)
     python3 -m venv venv && source venv/bin/activate
     pip install torch numpy opencv-python
     python video_upscaler.py
+
+Optional - drag and drop (drop a video and/or a model file onto the window):
+    pip install tkinterdnd2
+If its native extension cannot load (some Homebrew Tk 9 setups), the window says so
+and everything keeps working through the Browse buttons.
 """
 
 from __future__ import annotations
@@ -58,17 +63,25 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import cv2
 import numpy as np
-import torch
+import torch 
 import torch.nn as nn
 import torch.nn.functional as F
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+# Optional drag-and-drop support (pip install tkinterdnd2). Without it the app
+# works exactly as before, using the Browse buttons.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:
+    DND_FILES = TkinterDnD = None
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
 VIDEO_EXTS = (".mp4", ".avi", ".mkv")
+MODEL_EXTS = (".pth",)
 SCALE_CHOICES = ["1.5x", "2x", "3x", "4x"]
 TILE_CHOICES = ["Auto", "Off", "256", "384", "512", "768"]
 TILE_PAD = 16          # extra context pixels around each tile (cropped away)
@@ -810,8 +823,10 @@ class UpscaleWorker(threading.Thread):
 # GUI
 # --------------------------------------------------------------------------- #
 class UpscalerApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, dnd: str = "off"):
         self.root = root
+        self.dnd_status = dnd                  # "on" or "off (reason)"
+        self.dnd_on = dnd == "on"
         root.title("ESRGAN Video Upscaler")
         root.minsize(680, 0)
 
@@ -826,7 +841,9 @@ class UpscalerApp:
         self.batch_var = tk.IntVar(value=4)
         self.tile_var = tk.StringVar(value="Auto")
         self.half_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="Choose a video and a model, then press Start.")
+        self.status_var = tk.StringVar(value=(
+            "Drag a video and a model onto this window (or use Browse), then press Start."
+            if self.dnd_on else "Choose a video and a model, then press Start."))
 
         self._lockable: list = []       # widgets disabled while a job runs
         self._build_ui()
@@ -881,8 +898,11 @@ class UpscalerApp:
         self.start_btn = ttk.Button(btns, text="Start Upscaling", command=self._start)
         self.start_btn.pack(side="right")
 
-        ttk.Label(f, text=f"Compute device: {device_label(pick_device())}",
+        ttk.Label(f, text=f"Compute device: {device_label(pick_device())}   |   "
+                          f"Drag and drop: {self.dnd_status}",
                   foreground="gray").grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        if self.dnd_on:
+            self._enable_drop(self.root)
 
     # -- file dialogs -------------------------------------------------------- #
     def _browse_video(self) -> None:
@@ -890,13 +910,64 @@ class UpscalerApp:
             title="Select input video",
             filetypes=[("Video files", tuple("*" + e for e in VIDEO_EXTS)), ("All files", "*.*")])
         if p:
-            self.video_var.set(p)
+            self._set_video(p)
 
     def _browse_model(self) -> None:
         p = filedialog.askopenfilename(title="Select ESRGAN model",
                                        filetypes=[("PyTorch model", "*.pth"), ("All files", "*.*")])
         if p:
-            self.model_var.set(p)
+            self._set_model(p)
+
+    # -- drag and drop ------------------------------------------------------- #
+    def _set_video(self, path: str) -> None:
+        self.video_var.set(path)
+
+    def _set_model(self, path: str) -> None:
+        self.model_var.set(path)
+
+    def _enable_drop(self, widget) -> None:
+        """Let ``widget`` and everything inside it accept dropped files."""
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            pass                                          # a widget that refuses is simply skipped
+        for child in widget.winfo_children():
+            self._enable_drop(child)
+
+    def _on_drop(self, event):
+        """Sort dropped files into the video and the model by their extension."""
+        action = getattr(event, "action", None) or "copy"
+        if self.worker and self.worker.is_alive():
+            self.status_var.set("A job is running - drop files again once it has finished.")
+            return action
+        try:
+            paths = list(self.root.tk.splitlist(event.data))     # copes with spaces and braces
+        except tk.TclError:
+            paths = [str(event.data)]
+        video = model = None
+        ignored: List[str] = []
+        for p in paths:
+            ext, is_file = Path(p).suffix.lower(), os.path.isfile(p)
+            if is_file and ext in VIDEO_EXTS and video is None:
+                video = p
+            elif is_file and ext in MODEL_EXTS and model is None:
+                model = p
+            else:
+                ignored.append(Path(p).name or p)
+        loaded: List[str] = []
+        if video:
+            self._set_video(video)
+            loaded.append(f"video {Path(video).name}")
+        if model:
+            self._set_model(model)
+            loaded.append(f"model {Path(model).name}")
+        text = ("Loaded " + " and ".join(loaded)) if loaded else "Nothing loaded"
+        if ignored:
+            text += (f". Ignored: {', '.join(ignored)} (a video must be "
+                     f"{'/'.join(VIDEO_EXTS)}, a model {'/'.join(MODEL_EXTS)}; one of each at a time)")
+        self.status_var.set(text)
+        return action
 
     def _browse_output(self) -> None:
         p = self._ask_save_path()
@@ -1005,9 +1076,26 @@ class UpscalerApp:
             messagebox.showerror("Upscaling failed", msg[1])
 
 
+def make_root() -> Tuple[tk.Tk, str]:
+    """Create the Tk root. Returns (root, drag-and-drop status text for the window)."""
+    if TkinterDnD is None:
+        return tk.Tk(), "off (pip install tkinterdnd2 to enable)"
+    try:
+        return TkinterDnD.Tk(), "on"
+    except Exception as exc:               # tkdnd's native extension could not be loaded
+        print(f"Drag and drop disabled: {exc}", file=sys.stderr)
+        leaked = getattr(tk, "_default_root", None)      # the half-built root, if any
+        if leaked is not None:
+            try:
+                leaked.destroy()
+            except Exception:
+                pass
+        return tk.Tk(), "off (tkdnd could not load - see the note at the top of the script)"
+
+
 def main() -> None:
-    root = tk.Tk()
-    UpscalerApp(root)
+    root, dnd = make_root()
+    UpscalerApp(root, dnd)
     root.mainloop()
 
 

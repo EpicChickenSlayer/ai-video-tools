@@ -23,13 +23,8 @@ Key design points
   right fraction between them (24 -> 60 fps needs fractions 0.4, 0.8, 0.2, 0.6;
   25 -> 60 needs eleven different ones). Frames that land exactly on a source
   frame are copied untouched. Duration and A/V sync are unchanged.
-* Variable frame rate (phone videos, screen recordings): the real timestamp of
-  every source frame is read with ffprobe and used instead of assuming evenly
-  spaced frames, so motion keeps its true speed. Gaps longer than 0.25 s (a
-  static screen) are held instead of morphed.
-* Scene cuts are detected and never blended (the earlier frame is held instead).
-  A camera pan, zoom or brightness change is not mistaken for a cut. Identical
-  neighbouring frames are copied without running the model.
+* Scene cuts are detected and never blended (the earlier frame is held instead),
+  and identical neighbouring frames are copied without running the model.
 * Memory-aware batching with automatic back-off: if the GPU runs out of memory
   the batch shrinks first, then the flow resolution, and the job continues.
 * Heavy work runs in a worker thread and talks to the GUI through a queue
@@ -41,6 +36,11 @@ Setup (macOS)
     python3 -m venv venv && source venv/bin/activate
     pip install torch numpy opencv-python
     python video_interpolator.py
+
+Optional - drag and drop (drop a video and/or a model file onto the window):
+    pip install tkinterdnd2
+If its native extension cannot load (some Homebrew Tk 9 setups), the window says so
+and everything keeps working through the Browse buttons.
 
 Model: download a RIFE release (v4.25 or v4.26 recommended) from
 https://github.com/hzwer/Practical-RIFE (links in its README), unzip it and
@@ -79,28 +79,32 @@ import torch.nn.functional as F
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+# Optional drag-and-drop support (pip install tkinterdnd2). Without it the app
+# works exactly as before, using the Browse buttons.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:
+    DND_FILES = TkinterDnD = None
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
 VIDEO_EXTS = (".mp4", ".avi", ".mkv")
+MODEL_EXTS = (".pkl", ".pth", ".pt")
 MODEL_PATTERNS = ("*.pkl", "*.pth", "*.pt")
 FPS_CHOICES = ["60", "50", "48", "90", "120"]
 FLOW_SCALE_CHOICES = ["Auto", "1.0", "0.5", "0.25"]
 MIN_FPS_GAIN = 1.1            # target fps must be at least 10 % above the source fps
-SNAP = 0.03                   # within 3 % of a source frame interval -> just copy that frame
-MAX_INTERP_GAP = 0.25         # seconds; a longer gap between source frames is held, not morphed
-CFR_TOLERANCE = 0.02          # timestamps within 2 % of a frame of an even grid = constant frame rate
-CFR_TOLERANCE_MIN_S = 0.0011  # ... and never stricter than container rounding (MKV stores milliseconds)
+SNAP = 0.01                   # within 1 % of a source frame -> just copy that frame
 PENDING_CAP = 48              # max output frames held in memory before writing them
 ALLOW_UNSAFE_PICKLE = False   # see _read_checkpoint(); keep False unless you trust the file
 
 # Frame-pair analysis (done on small grey thumbnails, values 0..1)
 THUMB_SIZE = (160, 90)
-DUP_MAX_DIFF = 1.0 / 255.0    # no pixel differs by more than this -> identical frames
-CUT_CORR = 0.30               # brightness-normalised correlation below this ...
-CUT_PAN_RESPONSE = 0.35       # ... AND no global shift explains it (phase-correlation peak) -> hard cut
-#   Measured on 720p test footage: unrelated shots peak at 0.0-0.23, while pans, shakes, zooms,
-#   rotations and large moving objects never fall below 0.52, so 0.35 sits in the gap.
+DUP_MAX_DIFF = 2.0 / 255.0    # no pixel differs by more than this -> identical frames
+SCENE_CUT_MAD = 0.20          # mean absolute difference above this -> hard cut
+SCENE_CUT_MIN_MAD = 0.04      # a weakly correlated pair is only a cut above this ...
+SCENE_CUT_CORR = 0.20         # ... and below this correlation (cuts between similarly bright shots)
 
 
 # --------------------------------------------------------------------------- #
@@ -434,36 +438,22 @@ def make_thumb(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
 
-_HANN: Optional[np.ndarray] = None
-
-
 def classify_pair(t0: np.ndarray, t1: np.ndarray, detect_cuts: bool = True) -> str:
-    """Return "same" (identical), "cut" (different shots) or "motion" (interpolate).
-
-    A pair only counts as a cut if the two pictures are uncorrelated even after
-    removing brightness differences AND no single shift or zoom lines them up,
-    so fast pans, zooms, flashes and exposure changes are still interpolated.
-    (Measured on 1080p test footage: pans up to 300 px per frame score 0.79-0.98
-    on the shift test, real cuts 0.0-0.02.) When unsure it answers "motion".
-    """
-    if float(np.abs(t0 - t1).max()) <= DUP_MAX_DIFF + 1e-6:
+    """Return "same" (identical), "cut" (different shots) or "motion" (interpolate)."""
+    diff = np.abs(t0 - t1)
+    if float(diff.max()) <= DUP_MAX_DIFF:
         return "same"
     if not detect_cuts:
         return "motion"
-    a, b = t0 - t0.mean(), t1 - t1.mean()
-    den = math.sqrt(float((a * a).sum()) * float((b * b).sum()))
-    if den < 1e-6:                          # flat frames (fade to black): nothing to judge
-        return "motion"
-    if float((a * b).sum()) / den >= CUT_CORR:
-        return "motion"
-    global _HANN
-    try:
-        if _HANN is None:
-            _HANN = cv2.createHanningWindow(THUMB_SIZE, cv2.CV_32F)
-        _shift, response = cv2.phaseCorrelate(t0, t1, _HANN)
-    except cv2.error:
-        return "motion"
-    return "motion" if response >= CUT_PAN_RESPONSE else "cut"
+    mad = float(diff.mean())
+    if mad > SCENE_CUT_MAD:
+        return "cut"
+    if mad > SCENE_CUT_MIN_MAD:
+        a, b = t0 - t0.mean(), t1 - t1.mean()
+        den = math.sqrt(float((a * a).sum()) * float((b * b).sum()))
+        if den > 1e-6 and float((a * b).sum()) / den < SCENE_CUT_CORR:
+            return "cut"
+    return "motion"
 
 
 # --------------------------------------------------------------------------- #
@@ -733,74 +723,6 @@ def _fmt_time(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Source timing (constant or variable frame rate)
-# --------------------------------------------------------------------------- #
-def find_ffprobe(ffmpeg: Optional[str]) -> Optional[str]:
-    exe = shutil.which("ffprobe")
-    if exe:
-        return exe
-    dirs = ([os.path.dirname(ffmpeg)] if ffmpeg else []) + ["/opt/homebrew/bin", "/usr/local/bin"]
-    for d in dirs:
-        p = os.path.join(d, "ffprobe")
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
-
-
-def read_frame_times(ffprobe: str, path: str) -> Optional[List[Fraction]]:
-    """Presentation time (seconds) of every video frame, in display order, or None."""
-    try:
-        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
-                              "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
-                             capture_output=True, text=True, timeout=300).stdout
-    except Exception:
-        return None
-    times: List[Fraction] = []
-    for line in out.splitlines():
-        s = line.strip().strip(",")
-        if s and s != "N/A":
-            try:
-                times.append(Fraction(s))
-            except (ValueError, ZeroDivisionError):
-                pass
-    return sorted(times) or None
-
-
-@dataclass
-class Timing:
-    times: Optional[List[Fraction]]   # real frame timestamps for variable-rate video, else None
-    fps: Fraction                     # constant rate, or the average rate for variable video
-    tail: Fraction                    # how long the last frame stays on screen (seconds)
-    note: str                         # appended to the status line
-
-
-def analyse_timing(times: Optional[List[Fraction]], nominal_fps: Optional[float]) -> Timing:
-    """Constant rate -> exact rational schedule; variable rate -> follow the real timestamps."""
-    nominal = None
-    if nominal_fps and math.isfinite(nominal_fps) and 1 <= nominal_fps <= 240:
-        nominal = Fraction(nominal_fps).limit_denominator(100000)        # 29.97 -> 30000/1001
-    # Note: OpenCV's frame count is only an estimate for MKV/AVI/VFR files, so it is deliberately
-    # NOT compared with the number of timestamps (doing so used to switch VFR handling off).
-    if times is None or len(times) < 3 or times[-1] <= times[0]:
-        fps = nominal or Fraction(30)
-        return Timing(None, fps, 1 / fps, "" if nominal else " - source FPS unknown, assuming 30")
-
-    avg = Fraction(len(times) - 1) / (times[-1] - times[0])
-    dev = float(max(abs((t - times[0]) - Fraction(k) / avg) for k, t in enumerate(times)))
-    if dev <= max(CFR_TOLERANCE / float(avg), CFR_TOLERANCE_MIN_S):
-        # Evenly spaced: keep the exact schedule, using the nominal rate when it agrees.
-        fps = nominal if nominal and abs(nominal - avg) / avg < Fraction(1, 100) else avg.limit_denominator(100000)
-        return Timing(None, fps, 1 / fps, "")
-
-    gaps = sorted(b - a for a, b in zip(times, times[1:]) if b > a)
-    tail = gaps[len(gaps) // 2] if gaps else 1 / avg
-    note = (f" - variable frame rate detected (average {float(avg):.2f} fps, spacing "
-            f"{float(gaps[0]) * 1000:.0f}-{float(gaps[-1]) * 1000:.0f} ms): using the real frame timestamps"
-            if gaps else "")
-    return Timing(times, avg.limit_denominator(100000), tail, note)
-
-
-# --------------------------------------------------------------------------- #
 # Worker thread
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -819,7 +741,7 @@ class InterpolateWorker(threading.Thread):
     """Reads the video, synthesises the in-between frames and writes the result.
 
     Messages sent to the GUI through ``out_q``:
-        ("status", text) | ("progress", done, total) | ("done", path, seconds, summary)
+        ("status", text) | ("progress", done, total) | ("done", path, seconds)
         ("error", text)  | ("cancelled",)
     """
 
@@ -884,40 +806,20 @@ class InterpolateWorker(threading.Thread):
 
             first = prep(first)
             total_in = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            fps_note = ""
+            if not fps or not math.isfinite(fps) or fps < 1 or fps > 240:
+                fps, fps_note = 30.0, " (source FPS unknown, assuming 30)"
 
-            # Frame timing: an exact rational schedule for constant-rate video (29.97 ->
-            # 30000/1001), the real per-frame timestamps for variable-rate video.
-            ffmpeg = find_ffmpeg()
-            ffprobe = find_ffprobe(ffmpeg)
-            self._status("Reading frame timestamps...")
-            timing = analyse_timing(read_frame_times(ffprobe, cfg.video_path) if ffprobe else None,
-                                    cap.get(cv2.CAP_PROP_FPS))
-            in_fps, times = timing.fps, timing.times
+            # Exact rational frame rates keep long videos in sync (29.97 -> 30000/1001).
+            in_fps = Fraction(fps).limit_denominator(100000)
             out_fps = Fraction(cfg.target_fps)
             if out_fps < in_fps * Fraction(int(MIN_FPS_GAIN * 100), 100):
                 raise InterpolatorError(
                     f"The source is {float(in_fps):.3f} fps. Pick a target frame rate at least "
                     f"{int(round((MIN_FPS_GAIN - 1) * 100))}% higher than that.")
-            # Output starts at time 0 (like the audio); only a file that really starts late shifts it.
-            origin = times[0] if times and times[0] > 2 else Fraction(0)
-
-            def src_time(k: int) -> Fraction:
-                """Presentation time (seconds) of source frame k."""
-                if times is None:
-                    return Fraction(k) / in_fps
-                if k < len(times):
-                    return times[k]
-                return times[-1] + (k - len(times) + 1) * timing.tail
-
-            def out_time(k: int) -> Fraction:
-                return origin + Fraction(k) / out_fps
-
-            if times is not None:
-                out_total = math.ceil((times[-1] + timing.tail - origin) * out_fps)
-            elif total_in > 0:
-                out_total = math.ceil(Fraction(total_in) * out_fps / in_fps)
-            else:
-                out_total = 0
+            ratio = in_fps / out_fps                  # source frames per output frame (< 1)
+            out_total = math.ceil(total_in / ratio) if total_in > 0 else 0
 
             # ---- 2. load the model ---------------------------------------- #
             self._status("Loading model...")
@@ -926,9 +828,10 @@ class InterpolateWorker(threading.Thread):
             engine = RifeEngine(model, device, (out_w, out_h), cfg.batch_size, cfg.flow_scale,
                                 cfg.use_half, self.cancel, notify=self._notify)
             self._status(f"{model.arch} on {device_label(device)}; {src_w}x{src_h}, "
-                         f"{float(in_fps):.3f} -> {cfg.target_fps} fps{timing.note}")
+                         f"{float(in_fps):.3f} -> {cfg.target_fps} fps{fps_note}")
 
             # ---- 3. open the writer --------------------------------------- #
+            ffmpeg = find_ffmpeg()
             if ffmpeg:
                 self._writer = FFmpegWriter(ffmpeg, cfg.output_path, out_w, out_h, out_fps, cfg.video_path)
             else:
@@ -966,16 +869,9 @@ class InterpolateWorker(threading.Thread):
                 pending, n_jobs = [], 0
                 report()
 
-            stats = {"interpolated": 0, "cut": 0, "same": 0, "gap": 0}
             j = 0                              # index of the next output frame
             i = 0                              # index of the source frame held in `prev`
             prev, prev_thumb = first, make_thumb(first)
-            # A file whose first frame appears after time 0 holds it, so the audio stays in sync.
-            while out_time(j) < src_time(0):
-                pending.append(("frame", prev))
-                j += 1
-                if len(pending) >= PENDING_CAP:
-                    flush()
             while True:
                 if self.cancel.is_set():
                     raise Cancelled()
@@ -984,19 +880,14 @@ class InterpolateWorker(threading.Thread):
                     break
                 nxt = prep(nxt)
                 nxt_thumb = make_thumb(nxt)
-                t_i, t_n = src_time(i), src_time(i + 1)
-                gap = t_n - t_i
                 kind: Optional[str] = None     # classified lazily, once per frame pair
-                # This pair covers [t_i, t_n); output frame j sits at out_time(j) >= t_i.
+                # Every output frame k sits at source position p = k * in_fps / out_fps.
                 while True:
-                    tj = out_time(j)
-                    if tj >= t_n:              # also true for a zero-length pair, so gap > 0 below
+                    p = j * ratio
+                    if p >= i + 1:
                         break
-                    frac = float((tj - t_i) / gap)
-                    if float(gap) > MAX_INTERP_GAP:      # a still stretch (screen recording): hold
-                        item = ("frame", prev)
-                        stats["gap"] += 1
-                    elif frac < SNAP:
+                    frac = float(p - i)
+                    if frac < SNAP:
                         item = ("frame", prev)
                     elif frac > 1.0 - SNAP:
                         item = ("frame", nxt)
@@ -1006,10 +897,8 @@ class InterpolateWorker(threading.Thread):
                         if kind == "motion":
                             item = ("job", prev, nxt, frac)
                             n_jobs += 1
-                            stats["interpolated"] += 1
-                        else:                  # identical frames or a scene cut: keep showing the earlier frame
-                            item = ("frame", prev)
-                            stats[kind] += 1
+                        else:                  # identical frames or a scene cut: hold the nearer frame
+                            item = ("frame", prev if frac < 0.5 else nxt)
                     pending.append(item)
                     j += 1
                     if n_jobs >= batch or len(pending) >= PENDING_CAP:
@@ -1017,8 +906,7 @@ class InterpolateWorker(threading.Thread):
                 prev, prev_thumb, i = nxt, nxt_thumb, i + 1
 
             # The last source frame has no successor: hold it for the rest of its duration.
-            t_end = src_time(i) + timing.tail
-            while out_time(j) < t_end:
+            while j * ratio < i + 1:
                 pending.append(("frame", prev))
                 j += 1
                 if len(pending) >= PENDING_CAP:
@@ -1031,14 +919,7 @@ class InterpolateWorker(threading.Thread):
             self._writer = None
             if not os.path.isfile(cfg.output_path) or os.path.getsize(cfg.output_path) == 0:
                 raise InterpolatorError("The output file was not created.")
-            parts = [f"{stats['interpolated']} frames interpolated"]
-            if stats["cut"]:
-                parts.append(f"{stats['cut']} held at scene cuts")
-            if stats["same"]:
-                parts.append(f"{stats['same']} held on identical frames")
-            if stats["gap"]:
-                parts.append(f"{stats['gap']} held across long gaps")
-            self.q.put(("done", cfg.output_path, time.time() - t0, ", ".join(parts)))
+            self.q.put(("done", cfg.output_path, time.time() - t0))
         finally:
             cap.release()
 
@@ -1047,8 +928,10 @@ class InterpolateWorker(threading.Thread):
 # GUI
 # --------------------------------------------------------------------------- #
 class InterpolatorApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, dnd: str = "off"):
         self.root = root
+        self.dnd_status = dnd                  # "on" or "off (reason)"
+        self.dnd_on = dnd == "on"
         root.title("RIFE Video Interpolator")
         root.minsize(700, 0)
 
@@ -1065,7 +948,9 @@ class InterpolatorApp:
         self.half_var = tk.BooleanVar(value=True)
         self.cut_var = tk.BooleanVar(value=True)
         self.info_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="Choose a video and a RIFE model, then press Start.")
+        self.status_var = tk.StringVar(value=(
+            "Drag a video and a RIFE model onto this window (or use Browse), then press Start."
+            if self.dnd_on else "Choose a video and a RIFE model, then press Start."))
 
         self._source: Optional[Tuple[int, int, float, int]] = None
         self._lockable: list = []       # widgets disabled while a job runs
@@ -1129,8 +1014,11 @@ class InterpolatorApp:
         self.start_btn = ttk.Button(btns, text="Start Interpolation", command=self._start)
         self.start_btn.pack(side="right")
 
-        ttk.Label(f, text=f"Compute device: {device_label(pick_device())}",
+        ttk.Label(f, text=f"Compute device: {device_label(pick_device())}   |   "
+                          f"Drag and drop: {self.dnd_status}",
                   foreground="gray").grid(row=9, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        if self.dnd_on:
+            self._enable_drop(self.root)
 
     # -- file dialogs -------------------------------------------------------- #
     def _browse_video(self) -> None:
@@ -1138,15 +1026,66 @@ class InterpolatorApp:
             title="Select input video",
             filetypes=[("Video files", tuple("*" + e for e in VIDEO_EXTS)), ("All files", "*.*")])
         if p:
-            self.video_var.set(p)
-            self._source = probe_video(p)
-            self._update_info()
+            self._set_video(p)
 
     def _browse_model(self) -> None:
         p = filedialog.askopenfilename(title="Select RIFE model (flownet.pkl)",
                                        filetypes=[("RIFE model", MODEL_PATTERNS), ("All files", "*.*")])
         if p:
-            self.model_var.set(p)
+            self._set_model(p)
+
+    # -- drag and drop ------------------------------------------------------- #
+    def _set_video(self, path: str) -> None:
+        self.video_var.set(path)
+        self._source = probe_video(path)
+        self._update_info()
+
+    def _set_model(self, path: str) -> None:
+        self.model_var.set(path)
+
+    def _enable_drop(self, widget) -> None:
+        """Let ``widget`` and everything inside it accept dropped files."""
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            pass                                          # a widget that refuses is simply skipped
+        for child in widget.winfo_children():
+            self._enable_drop(child)
+
+    def _on_drop(self, event):
+        """Sort dropped files into the video and the model by their extension."""
+        action = getattr(event, "action", None) or "copy"
+        if self.worker and self.worker.is_alive():
+            self.status_var.set("A job is running - drop files again once it has finished.")
+            return action
+        try:
+            paths = list(self.root.tk.splitlist(event.data))     # copes with spaces and braces
+        except tk.TclError:
+            paths = [str(event.data)]
+        video = model = None
+        ignored: List[str] = []
+        for p in paths:
+            ext, is_file = Path(p).suffix.lower(), os.path.isfile(p)
+            if is_file and ext in VIDEO_EXTS and video is None:
+                video = p
+            elif is_file and ext in MODEL_EXTS and model is None:
+                model = p
+            else:
+                ignored.append(Path(p).name or p)
+        loaded: List[str] = []
+        if video:
+            self._set_video(video)
+            loaded.append(f"video {Path(video).name}")
+        if model:
+            self._set_model(model)
+            loaded.append(f"model {Path(model).name}")
+        text = ("Loaded " + " and ".join(loaded)) if loaded else "Nothing loaded"
+        if ignored:
+            text += (f". Ignored: {', '.join(ignored)} (a video must be "
+                     f"{'/'.join(VIDEO_EXTS)}, a model {'/'.join(MODEL_EXTS)}; one of each at a time)")
+        self.status_var.set(text)
+        return action
 
     def _browse_output(self) -> None:
         p = self._ask_save_path()
@@ -1254,9 +1193,8 @@ class InterpolatorApp:
             self.progress.stop()
             self.progress.configure(mode="determinate", value=100)
             self._set_running(False)
-            summary = msg[3] if len(msg) > 3 else ""
-            self.status_var.set(f"Finished in {_fmt_time(msg[2])} ({summary}). Saved to {msg[1]}")
-            messagebox.showinfo("Done", f"Interpolated video saved to:\n{msg[1]}\n\n{summary}")
+            self.status_var.set(f"Finished in {_fmt_time(msg[2])}. Saved to {msg[1]}")
+            messagebox.showinfo("Done", f"Interpolated video saved to:\n{msg[1]}")
         elif kind == "cancelled":
             self.progress.stop()
             self.progress.configure(mode="determinate", value=0)
@@ -1270,9 +1208,26 @@ class InterpolatorApp:
             messagebox.showerror("Interpolation failed", msg[1])
 
 
+def make_root() -> Tuple[tk.Tk, str]:
+    """Create the Tk root. Returns (root, drag-and-drop status text for the window)."""
+    if TkinterDnD is None:
+        return tk.Tk(), "off (pip install tkinterdnd2 to enable)"
+    try:
+        return TkinterDnD.Tk(), "on"
+    except Exception as exc:               # tkdnd's native extension could not be loaded
+        print(f"Drag and drop disabled: {exc}", file=sys.stderr)
+        leaked = getattr(tk, "_default_root", None)      # the half-built root, if any
+        if leaked is not None:
+            try:
+                leaked.destroy()
+            except Exception:
+                pass
+        return tk.Tk(), "off (tkdnd could not load - see the note at the top of the script)"
+
+
 def main() -> None:
-    root = tk.Tk()
-    InterpolatorApp(root)
+    root, dnd = make_root()
+    InterpolatorApp(root, dnd)
     root.mainloop()
 
 
